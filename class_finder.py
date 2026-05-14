@@ -2,11 +2,13 @@ import asyncio
 import json
 import os
 import re
+import threading
 import time
 import requests
 import psycopg2
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
+from urllib.parse import quote as url_quote
 
 from selenium import webdriver
 from selenium.webdriver.common.keys import Keys
@@ -107,22 +109,47 @@ def invalidate_seat_cache(crn: str = None):
     else:
         _seat_cache.pop(crn, None)
 
+# ---- WATCHERS CACHE ----
+_watchers_cache: dict = {}  # {crn: [uid, ...]}
+
+def get_cached_watchers(crn: str):
+    return _watchers_cache.get(crn)
+
+def update_watchers_cache(crn: str, uids: list):
+    _watchers_cache[crn] = uids
+
+def invalidate_watchers_cache(crn: str = None):
+    global _watchers_cache
+    if crn is None:
+        _watchers_cache = {}
+    else:
+        _watchers_cache.pop(crn, None)
+
+# Protects multi-step read-modify-write operations on _watchers_cache
+_cache_lock = threading.Lock()
+
+# ---- RATE LIMITING ----
+_last_track: dict = {}  # {uid: timestamp of last /track call}
+TRACK_COOLDOWN = 10      # seconds between /track invocations per user
+MAX_CRNS_PER_USER = 10   # max CRNs any one user may watch simultaneously
+
 def init_seat_cache():
-    """Populate _seat_cache from sections for tracked CRNs only."""
+    """Populate seat and watchers caches from tracked CRNs in one query."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT s.crn, s.open_seats
+                SELECT s.crn, s.open_seats, ms.discord_uids
                 FROM sections s
                 JOIN monitored_sections ms ON s.crn = ms.crn
             """)
             rows = cur.fetchall()
-        for crn, open_seats in rows:
+        for crn, open_seats, discord_uids in rows:
             update_seat_cache(str(crn), open_seats)
-        print(f"[Cache] Initialized seat cache with {len(rows)} entries.")
+            update_watchers_cache(str(crn), discord_uids or [])
+        print(f"[Cache] Initialized seat + watchers cache with {len(rows)} entries.")
     except Exception as e:
-        print(f"[Cache] Failed to initialize seat cache: {e}")
+        print(f"[Cache] Failed to initialize caches: {e}")
     finally:
         conn.close()
 
@@ -145,10 +172,12 @@ async def _refresh_api_session(driver):
 
 def fetch_course_json_http(session, term, subject, course):
     """Hit the CollegeScheduler API using auth cookies (no Selenium navigation)."""
+    s = url_quote(str(subject), safe='')
+    t = url_quote(str(term), safe='')
     if str(subject).upper() == 'KINE':
-        url = f"https://tamu.collegescheduler.com/api/terms/{term}/subjects/{subject}/courses/{course}/15/regblocks"
+        url = f"https://tamu.collegescheduler.com/api/terms/{t}/subjects/{s}/courses/{course}/15/regblocks"
     else:
-        url = f"https://tamu.collegescheduler.com/api/terms/{term}/subjects/{subject}/courses/{course}/regblocks"
+        url = f"https://tamu.collegescheduler.com/api/terms/{t}/subjects/{s}/courses/{course}/regblocks"
     resp = session.get(url, timeout=15)
     resp.raise_for_status()
     return resp.json(), url
@@ -160,17 +189,17 @@ async def check_courses():
         print("Checking tracked seats...")
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT ms.crn, ms.open_seats AS old_seats, ms.discord_uids,
+                SELECT ms.crn, ms.open_seats AS old_seats,
                        s.open_seats AS current_seats, s.subject, s.course, s.term
                 FROM monitored_sections ms
                 JOIN sections s ON ms.crn = s.crn
             """)
             monitored = cur.fetchall()
 
-        for crn, old_seats, discord_uids, current_seats, subject, course, term in monitored:
+        for crn, old_seats, current_seats, subject, course, term in monitored:
             if old_seats != current_seats:
                 print(f"[DEBUG] {crn} old:{old_seats} -> new:{current_seats}")
-                for uid in (discord_uids or []):
+                for uid in (get_cached_watchers(crn) or []):
                     try:
                         user = bot.get_user(uid) or await bot.fetch_user(uid)
                         if user:
@@ -198,10 +227,11 @@ async def check_courses():
 
 # ---- OWNER GUARD ----
 def _is_owner(interaction: discord.Interaction) -> bool:
-    owner_uid = os.getenv('DISCORD_OWNER_UID')
-    if not owner_uid:
+    owner_uid = os.getenv('DISCORD_OWNER_UID', '')
+    try:
+        return bool(owner_uid) and interaction.user.id == int(owner_uid)
+    except ValueError:
         return False
-    return interaction.user.id == int(owner_uid)
 
 # ---- SLASH COMMANDS ----
 @bot.tree.command(name="track", description="Track a CRN for seat availability alerts")
@@ -215,30 +245,75 @@ async def track(interaction: discord.Interaction, subject: str, course: int, crn
     subject = subject.upper()
     uid = interaction.user.id
 
-    # 1. CRN already in seat cache — it's tracked by at least one user
-    if get_cached_seats(crn) is not None:
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT discord_uids FROM monitored_sections WHERE crn = %s", (crn,))
-                row = cur.fetchone()
-                if row:
-                    uids = row[0] or []
-                    if uid in uids:
-                        await interaction.followup.send(f"You're already tracking CRN {crn}.", ephemeral=True)
-                        return
-                    uids.append(uid)
-                    cur.execute(
-                        "UPDATE monitored_sections SET discord_uids = %s WHERE crn = %s",
-                        (json.dumps(uids), crn)
-                    )
-                    conn.commit()
-                    await interaction.followup.send(f"Now tracking CRN {crn} ✅", ephemeral=True)
-                    return
-        finally:
-            conn.close()
+    # Input validation — block path traversal before anything hits the network
+    if not re.fullmatch(r'[A-Z]{2,5}', subject):
+        await interaction.followup.send("❌ Invalid subject code.", ephemeral=True)
+        return
+    if not re.fullmatch(r'\d{4,6}', crn):
+        await interaction.followup.send("❌ Invalid CRN format.", ephemeral=True)
+        return
 
-    # 2. CRN not in cache — verify via API across all active terms
+    # Rate limit — prevent API / DB exhaustion from rapid calls
+    now = time.time()
+    if now - _last_track.get(uid, 0) < TRACK_COOLDOWN:
+        await interaction.followup.send("⏳ Please wait a moment before tracking another CRN.", ephemeral=True)
+        return
+    _last_track[uid] = now
+
+    # Already watching this CRN? (cache read — no lock needed for single dict.get)
+    if uid in (get_cached_watchers(crn) or []):
+        await interaction.followup.send(f"You're already tracking CRN {crn}.", ephemeral=True)
+        return
+
+    # Per-user CRN cap
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM monitored_sections WHERE discord_uids @> %s::jsonb",
+                (json.dumps([uid]),)
+            )
+            count = cur.fetchone()[0]
+        conn.close()
+    except Exception as e:
+        print(f"[ERROR] /track cap check uid={uid}: {e}")
+        await interaction.followup.send("❌ Something went wrong. Try again later.", ephemeral=True)
+        return
+
+    if count >= MAX_CRNS_PER_USER:
+        await interaction.followup.send(
+            f"❌ You are tracking {MAX_CRNS_PER_USER} CRNs (the maximum). Use /untrack to free a slot.",
+            ephemeral=True
+        )
+        return
+
+    # CRN already scraped — just add uid via atomic jsonb append
+    if get_cached_seats(crn) is not None:
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE monitored_sections
+                    SET discord_uids = (
+                        SELECT jsonb_agg(DISTINCT v)
+                        FROM jsonb_array_elements(discord_uids || %s::jsonb) v
+                    )
+                    WHERE crn = %s
+                    RETURNING discord_uids
+                """, (json.dumps([uid]), crn))
+                result = cur.fetchone()
+                conn.commit()
+            conn.close()
+            if result:
+                with _cache_lock:
+                    update_watchers_cache(crn, result[0] or [])
+            await interaction.followup.send(f"Now tracking CRN {crn} ✅", ephemeral=True)
+        except Exception as e:
+            print(f"[ERROR] /track (cache hit) crn={crn}: {e}")
+            await interaction.followup.send("❌ Something went wrong. Try again later.", ephemeral=True)
+        return
+
+    # CRN not in cache — verify via API across all active terms
     config = fetch_config_cached()
     terms = config.get("TERMS", [])
     found_section = None
@@ -264,7 +339,6 @@ async def track(interaction: discord.Interaction, subject: str, course: int, crn
         )
         return
 
-    # 3. Insert into sections and monitored_sections
     open_seats = found_section["openSeats"]
     instructor = found_section["instructor"][0]["name"] if found_section["instructor"] else None
     times = [
@@ -272,8 +346,8 @@ async def track(interaction: discord.Interaction, subject: str, course: int, crn
         for m in found_section["meetings"] if m["meetingType"] == "LEC"
     ]
 
-    conn = get_db_connection()
     try:
+        conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO sections (crn, term, subject, course, open_seats, instructor, times, last_updated)
@@ -284,33 +358,33 @@ async def track(interaction: discord.Interaction, subject: str, course: int, crn
                     last_updated = EXCLUDED.last_updated
             """, (crn, found_term, subject, course, open_seats, instructor, json.dumps(times)))
 
-            # Fetch or create monitored_sections row, then add uid (no-dup)
-            cur.execute("SELECT discord_uids FROM monitored_sections WHERE crn = %s", (crn,))
-            ms_row = cur.fetchone()
-            if ms_row:
-                uids = ms_row[0] or []
-                if uid not in uids:
-                    uids.append(uid)
-                cur.execute(
-                    "UPDATE monitored_sections SET discord_uids = %s, open_seats = %s WHERE crn = %s",
-                    (json.dumps(uids), open_seats, crn)
-                )
-            else:
-                cur.execute(
-                    "INSERT INTO monitored_sections (crn, open_seats, discord_uids) VALUES (%s, %s, %s)",
-                    (crn, open_seats, json.dumps([uid]))
-                )
-
+            # Atomic upsert — DB deduplicates UIDs, no TOCTOU window
+            cur.execute("""
+                INSERT INTO monitored_sections (crn, open_seats, discord_uids)
+                VALUES (%s, %s, %s::jsonb)
+                ON CONFLICT (crn) DO UPDATE SET
+                    discord_uids = (
+                        SELECT jsonb_agg(DISTINCT v)
+                        FROM jsonb_array_elements(
+                            monitored_sections.discord_uids || EXCLUDED.discord_uids
+                        ) v
+                    ),
+                    open_seats = EXCLUDED.open_seats
+                RETURNING discord_uids
+            """, (crn, open_seats, json.dumps([uid])))
+            result = cur.fetchone()
             conn.commit()
+        conn.close()
         update_seat_cache(crn, open_seats)
+        with _cache_lock:
+            update_watchers_cache(crn, result[0] if result else [uid])
         await interaction.followup.send(
             f"Now tracking CRN {crn} ({subject} {course}) — {open_seats} seats open ✅",
             ephemeral=True
         )
     except Exception as e:
-        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
-    finally:
-        conn.close()
+        print(f"[ERROR] /track insert crn={crn}: {e}")
+        await interaction.followup.send("❌ Something went wrong. Try again later.", ephemeral=True)
 
 
 @bot.tree.command(name="untrack", description="Stop tracking a CRN")
@@ -341,14 +415,19 @@ async def untrack(interaction: discord.Interaction, crn: str):
                     "UPDATE monitored_sections SET discord_uids = %s WHERE crn = %s",
                     (json.dumps(uids), crn)
                 )
+                with _cache_lock:
+                    update_watchers_cache(crn, uids)
             else:
                 cur.execute("DELETE FROM monitored_sections WHERE crn = %s", (crn,))
-                invalidate_seat_cache(crn)
+                with _cache_lock:
+                    invalidate_seat_cache(crn)
+                    invalidate_watchers_cache(crn)
 
             conn.commit()
         await interaction.response.send_message(f"🗑️ Stopped tracking CRN {crn}.", ephemeral=True)
     except Exception as e:
-        await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+        print(f"[ERROR] /untrack crn={crn}: {e}")
+        await interaction.response.send_message("❌ Something went wrong. Try again later.", ephemeral=True)
     finally:
         conn.close()
 
@@ -382,7 +461,8 @@ async def status(interaction: discord.Interaction):
             )
         await interaction.response.send_message(embed=embed, ephemeral=True)
     except Exception as e:
-        await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+        print(f"[ERROR] /status uid={uid}: {e}")
+        await interaction.response.send_message("❌ Something went wrong. Try again later.", ephemeral=True)
     finally:
         conn.close()
 
@@ -441,10 +521,12 @@ def generate_urls():
 
     urls = []
     for term, subject, course in combos:
+        s = url_quote(str(subject), safe='')
+        t = url_quote(str(term), safe='')
         if str(subject).upper() == 'KINE':
-            urls.append(f"https://tamu.collegescheduler.com/api/terms/{term}/subjects/{subject}/courses/{course}/15/regblocks")
+            urls.append(f"https://tamu.collegescheduler.com/api/terms/{t}/subjects/{s}/courses/{course}/15/regblocks")
         else:
-            urls.append(f"https://tamu.collegescheduler.com/api/terms/{term}/subjects/{subject}/courses/{course}/regblocks")
+            urls.append(f"https://tamu.collegescheduler.com/api/terms/{t}/subjects/{s}/courses/{course}/regblocks")
     return urls
 
 
@@ -532,7 +614,6 @@ def login(email, password):
             code_element = driver.find_element(By.CSS_SELECTOR, "span.code-text")
             code = code_element.text.strip()
             if re.fullmatch(r'\d{3}', code):
-                print(f"Found verification code: {code}")
                 asyncio.run_coroutine_threadsafe(
                     discord_broadcast_code(bot, code), bot.loop
                 )
@@ -608,9 +689,7 @@ def fetch_all_data(driver):
         try:
             driver.get(url)
             WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "pre")))
-            content = driver.page_source
-            start, end = content.find("{"), content.rfind("}") + 1
-            json_data = json.loads(content[start:end])
+            json_data = json.loads(driver.find_element(By.TAG_NAME, "pre").text)
             data_collected.append({
                 "url": url,
                 "data": json_data,
@@ -659,6 +738,10 @@ async def on_ready():
         print(f"Synced {len(synced)} slash command(s).")
     except Exception as sync_err:
         print(f"Failed to sync commands: {sync_err}")
+
+    owner_uid_raw = os.getenv('DISCORD_OWNER_UID', '')
+    if not owner_uid_raw.strip().lstrip('-').isdigit():
+        print("[WARN] DISCORD_OWNER_UID is missing or non-numeric — /config and MFA DM will not work.")
 
     email = os.getenv("EMAIL")
     password = os.getenv("PASSWORD")
