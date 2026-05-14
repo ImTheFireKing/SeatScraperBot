@@ -173,11 +173,10 @@ async def _refresh_api_session(driver):
 def fetch_course_json_http(session, term, subject, course):
     """Hit the CollegeScheduler API using auth cookies (no Selenium navigation)."""
     s = url_quote(str(subject), safe='')
-    t = url_quote(str(term), safe='')
     if str(subject).upper() == 'KINE':
-        url = f"https://tamu.collegescheduler.com/api/terms/{t}/subjects/{s}/courses/{course}/15/regblocks"
+        url = f"https://tamu.collegescheduler.com/api/terms/{term}/subjects/{s}/courses/{course}/15/regblocks"
     else:
-        url = f"https://tamu.collegescheduler.com/api/terms/{t}/subjects/{s}/courses/{course}/regblocks"
+        url = f"https://tamu.collegescheduler.com/api/terms/{term}/subjects/{s}/courses/{course}/regblocks"
     resp = session.get(url, timeout=15)
     resp.raise_for_status()
     return resp.json(), url
@@ -522,11 +521,10 @@ def generate_urls():
     urls = []
     for term, subject, course in combos:
         s = url_quote(str(subject), safe='')
-        t = url_quote(str(term), safe='')
         if str(subject).upper() == 'KINE':
-            urls.append(f"https://tamu.collegescheduler.com/api/terms/{t}/subjects/{s}/courses/{course}/15/regblocks")
+            urls.append(f"https://tamu.collegescheduler.com/api/terms/{term}/subjects/{s}/courses/{course}/15/regblocks")
         else:
-            urls.append(f"https://tamu.collegescheduler.com/api/terms/{t}/subjects/{s}/courses/{course}/regblocks")
+            urls.append(f"https://tamu.collegescheduler.com/api/terms/{term}/subjects/{s}/courses/{course}/regblocks")
     return urls
 
 
