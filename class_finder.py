@@ -3,9 +3,8 @@ import json
 import os
 import re
 import time
+import requests
 import psycopg2
-import tempfile
-import threading
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
@@ -17,7 +16,8 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
+from discord import app_commands
 
 # Discord setup
 intents = discord.Intents.default()
@@ -36,8 +36,8 @@ def get_db_connection():
         host=os.getenv('NEON_HOST')
     )
 
+# ---- CONFIG (TERMS only) ----
 def fetch_config():
-    """Fetch SCRAPE_CONFIG from the database."""
     conn = get_db_connection()
     config = {}
     try:
@@ -51,7 +51,6 @@ def fetch_config():
 
 
 def update_config(key, value):
-    """Update or insert configuration key/value in the database."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -70,17 +69,12 @@ _config_cache = {
     "data": None,
     "timestamp": 0
 }
-CACHE_TTL = 300  # seconds (5 minutes)
+CACHE_TTL = 300  # seconds
 
 def fetch_config_cached(force_refresh=False):
-    """Fetch configuration with simple in-memory caching."""
     global _config_cache
-
-    # Check cache age
     if not force_refresh and _config_cache["data"] and (time.time() - _config_cache["timestamp"] < CACHE_TTL):
         return _config_cache["data"]
-
-    # Otherwise, fetch from DB
     config = fetch_config()
     _config_cache["data"] = config
     _config_cache["timestamp"] = time.time()
@@ -88,7 +82,6 @@ def fetch_config_cached(force_refresh=False):
 
 
 def invalidate_config_cache():
-    """Clear config cache after manual updates."""
     global _config_cache
     _config_cache = {"data": None, "timestamp": 0}
 
@@ -104,11 +97,10 @@ def get_all_cached_seats() -> dict:
     return dict(_seat_cache)
 
 def update_seat_cache(crn: str, open_seats: int):
-    """Write or overwrite the cached open_seats for a CRN."""
     _seat_cache[crn] = open_seats
 
 def invalidate_seat_cache(crn: str = None):
-    """Evict one CRN from the cache, or clear the entire cache if crn is None."""
+    """Evict one CRN or clear the entire cache if crn is None."""
     global _seat_cache
     if crn is None:
         _seat_cache = {}
@@ -116,11 +108,15 @@ def invalidate_seat_cache(crn: str = None):
         _seat_cache.pop(crn, None)
 
 def init_seat_cache():
-    """Populate _seat_cache from the sections table on startup."""
+    """Populate _seat_cache from sections for tracked CRNs only."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT crn, open_seats FROM sections")
+            cur.execute("""
+                SELECT s.crn, s.open_seats
+                FROM sections s
+                JOIN monitored_sections ms ON s.crn = ms.crn
+            """)
             rows = cur.fetchall()
         for crn, open_seats in rows:
             update_seat_cache(str(crn), open_seats)
@@ -130,33 +126,62 @@ def init_seat_cache():
     finally:
         conn.close()
 
+# ---- API SESSION (requests with Selenium cookies) ----
+def _build_requests_session(driver):
+    """Extract auth cookies from Selenium into a requests.Session."""
+    session = requests.Session()
+    for cookie in driver.get_cookies():
+        session.cookies.set(cookie['name'], cookie['value'])
+    session.headers['User-Agent'] = driver.execute_script("return navigator.userAgent")
+    return session
+
+
+async def _refresh_api_session(driver):
+    """Refresh bot.api_session with current Selenium cookies (called after each scrape)."""
+    bot.api_session = await asyncio.get_running_loop().run_in_executor(
+        None, _build_requests_session, driver
+    )
+
+
+def fetch_course_json_http(session, term, subject, course):
+    """Hit the CollegeScheduler API using auth cookies (no Selenium navigation)."""
+    if str(subject).upper() == 'KINE':
+        url = f"https://tamu.collegescheduler.com/api/terms/{term}/subjects/{subject}/courses/{course}/15/regblocks"
+    else:
+        url = f"https://tamu.collegescheduler.com/api/terms/{term}/subjects/{subject}/courses/{course}/regblocks"
+    resp = session.get(url, timeout=15)
+    resp.raise_for_status()
+    return resp.json(), url
+
 # ---- DISCORD: COURSE CHECKING LOOP ----
 async def check_courses():
     try:
         conn = get_db_connection()
-        print("Updating seats")
+        print("Checking tracked seats...")
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT ms.crn, ms.open_seats AS old_seats,
+                SELECT ms.crn, ms.open_seats AS old_seats, ms.discord_uids,
                        s.open_seats AS current_seats, s.subject, s.course, s.term
                 FROM monitored_sections ms
                 JOIN sections s ON ms.crn = s.crn
-                WHERE ms.active = TRUE
             """)
-            monitored_sections = cur.fetchall()
+            monitored = cur.fetchall()
 
-        for section in monitored_sections:
-            crn, old_seats, current_seats, subject, course, term = section
+        for crn, old_seats, discord_uids, current_seats, subject, course, term in monitored:
             if old_seats != current_seats:
                 print(f"[DEBUG] {crn} old:{old_seats} -> new:{current_seats}")
-                channel = bot.get_channel(int(os.getenv('DISCORD_CHANNEL_ID')))
-                if channel:
-                    await channel.send(
-                        f"🚨 Seat change detected!\n"
-                        f"**{subject} {course} ({term})**\n"
-                        f"CRN: {crn}\n"
-                        f"Seats: {old_seats} → {current_seats}"
-                    )
+                for uid in (discord_uids or []):
+                    try:
+                        user = bot.get_user(uid) or await bot.fetch_user(uid)
+                        if user:
+                            await user.send(
+                                f"🚨 Seat change detected!\n"
+                                f"**{subject} {course} ({term})**\n"
+                                f"CRN: {crn}\n"
+                                f"Seats: {old_seats} → {current_seats}"
+                            )
+                    except Exception as dm_err:
+                        print(f"[DM] Failed to notify user {uid}: {dm_err}")
 
                 with conn.cursor() as cur:
                     cur.execute("""
@@ -171,195 +196,274 @@ async def check_courses():
     finally:
         conn.close()
 
+# ---- OWNER GUARD ----
+def _is_owner(interaction: discord.Interaction) -> bool:
+    owner_uid = os.getenv('DISCORD_OWNER_UID')
+    if not owner_uid:
+        return False
+    return interaction.user.id == int(owner_uid)
 
-# ---- DISCORD COMMANDS ----
-@bot.command()
-async def track(ctx, crn: str):
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT crn FROM sections WHERE crn = %s", (crn,))
-            if not cur.fetchone():
-                await ctx.send("CRN not found ❌")
-                return
+# ---- SLASH COMMANDS ----
+@bot.tree.command(name="track", description="Track a CRN for seat availability alerts")
+@app_commands.describe(
+    subject="Subject code (e.g. CSCE)",
+    course="Course number (e.g. 331)",
+    crn="Course Registration Number"
+)
+async def track(interaction: discord.Interaction, subject: str, course: int, crn: str):
+    await interaction.response.defer(thinking=True)
+    subject = subject.upper()
+    uid = interaction.user.id
 
-            cur.execute("""
-                INSERT INTO monitored_sections (crn, channel_id, open_seats)
-                VALUES (%s, %s, (SELECT open_seats FROM sections WHERE crn = %s))
-                ON CONFLICT (crn) DO NOTHING
-            """, (crn, ctx.channel.id, crn))
-            conn.commit()
-            await ctx.send(f"Now tracking CRN {crn} ✅")
-    except Exception as e:
-        await ctx.send(f"Error: {e}")
-    finally:
-        conn.close()
-
-@bot.command()
-async def untrack(ctx, crn: str):
-    """Permanently stop tracking a CRN (delete from database)."""
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                DELETE FROM monitored_sections
-                WHERE crn = %s
-                RETURNING crn
-            """, (crn,))
-            deleted = cur.fetchone()
-            conn.commit()
-
-            if deleted:
-                invalidate_seat_cache(crn)
-                await ctx.send(f"🗑️ Deleted tracking record for CRN {crn}.")
-            else:
-                await ctx.send(f"⚠️ No CRN found: {crn}.")
-    except Exception as e:
-        await ctx.send(f"Error removing section: {e}")
-    finally:
-        conn.close()
-
-
-@bot.command()
-async def status(ctx, crn: str = None):
-    """Check current CRN status — or show all tracked."""
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            if crn:
-                cur.execute("""
-                    SELECT subject, course, term, open_seats, last_updated
-                    FROM sections
-                    WHERE crn = %s
-                """, (crn,))
-                result = cur.fetchone()
-                if result:
-                    subject, course, term, open_seats, last_updated = result
-                    embed = discord.Embed(
-                        title=f"{subject} {course} Status",
-                        description=f"**CRN:** {crn}",
-                        color=discord.Color.blue()
+    # 1. CRN already in seat cache — it's tracked by at least one user
+    if get_cached_seats(crn) is not None:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT discord_uids FROM monitored_sections WHERE crn = %s", (crn,))
+                row = cur.fetchone()
+                if row:
+                    uids = row[0] or []
+                    if uid in uids:
+                        await interaction.followup.send(f"You're already tracking CRN {crn}.", ephemeral=True)
+                        return
+                    uids.append(uid)
+                    cur.execute(
+                        "UPDATE monitored_sections SET discord_uids = %s WHERE crn = %s",
+                        (json.dumps(uids), crn)
                     )
-                    embed.add_field(name="Open Seats", value=open_seats)
-                    embed.add_field(name="Last Updated", value=last_updated.strftime("%m/%d %H:%M"))
-                    embed.add_field(name="Term", value=term)
-                    await ctx.send(embed=embed)
-                else:
-                    await ctx.send("CRN not found ❌")
-            else:
-                cur.execute("""
-                    SELECT s.crn, s.subject, s.course, s.open_seats, s.term
-                    FROM monitored_sections ms
-                    JOIN sections s ON ms.crn = s.crn
-                    WHERE ms.active = TRUE
-                """)
-                results = cur.fetchall()
-                if not results:
-                    await ctx.send("No active tracked CRNs found ❌")
+                    conn.commit()
+                    await interaction.followup.send(f"Now tracking CRN {crn} ✅", ephemeral=True)
                     return
+        finally:
+            conn.close()
 
-                embed = discord.Embed(
-                    title="Active Tracked CRNs",
-                    color=discord.Color.green()
-                )
-                for crn, subject, course, open_seats, term in results:
-                    embed.add_field(
-                        name=f"{subject} {course} ({term})",
-                        value=f"CRN: {crn}\nOpen Seats: {open_seats}",
-                        inline=False
-                    )
-                await ctx.send(embed=embed)
-    except Exception as e:
-        await ctx.send(f"Error fetching status: {str(e)}")
-    finally:
-        conn.close()
+    # 2. CRN not in cache — verify via API across all active terms
+    config = fetch_config_cached()
+    terms = config.get("TERMS", [])
+    found_section = None
+    found_term = None
 
-@bot.command(name="config")
-async def config_scrape(ctx, action: str, key: str, *values):
-    """Adjust scraping configuration dynamically via DB.
-    Examples:
-      !config add SUBJECTS ENGL
-      !config remove COURSES CSCE 213
-      !config replace TERMS Fall%202026%20-%20College%20Station
-      !config show SUBJECTS
-    """
-    key = key.upper()
-    valid_keys = ["TERMS", "SUBJECTS", "COURSES"]
+    for term_str in terms:
+        try:
+            data, _ = fetch_course_json_http(bot.api_session, term_str, subject, course)
+            for section in data.get("sections", []):
+                if section["id"] == crn and section["instructionMode"] == "Traditional Face-to-Face (F2F)":
+                    found_section = section
+                    found_term = term_str
+                    break
+            if found_section:
+                break
+        except Exception:
+            continue
 
-    if key not in valid_keys:
-        await ctx.send("Invalid key. Use TERMS, SUBJECTS, or COURSES.")
+    if not found_section:
+        await interaction.followup.send(
+            f"❌ CRN {crn} not found under {subject} {course} in any active term.",
+            ephemeral=True
+        )
         return
 
+    # 3. Insert into sections and monitored_sections
+    open_seats = found_section["openSeats"]
+    instructor = found_section["instructor"][0]["name"] if found_section["instructor"] else None
+    times = [
+        {"days": m["days"], "start": f"{m['startTime']:04d}", "end": f"{m['endTime']:04d}"}
+        for m in found_section["meetings"] if m["meetingType"] == "LEC"
+    ]
+
+    conn = get_db_connection()
     try:
-        config = fetch_config()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO sections (crn, term, subject, course, open_seats, instructor, times, last_updated)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (crn) DO UPDATE SET
+                    open_seats = EXCLUDED.open_seats,
+                    times = EXCLUDED.times,
+                    last_updated = EXCLUDED.last_updated
+            """, (crn, found_term, subject, course, open_seats, instructor, json.dumps(times)))
 
-        if action.lower() == "add":
-            if key == "COURSES":
-                subj, *nums = values
-                nums = [int(n) for n in nums]
-                config["COURSES"].setdefault(subj, []).extend(nums)
+            # Fetch or create monitored_sections row, then add uid (no-dup)
+            cur.execute("SELECT discord_uids FROM monitored_sections WHERE crn = %s", (crn,))
+            ms_row = cur.fetchone()
+            if ms_row:
+                uids = ms_row[0] or []
+                if uid not in uids:
+                    uids.append(uid)
+                cur.execute(
+                    "UPDATE monitored_sections SET discord_uids = %s, open_seats = %s WHERE crn = %s",
+                    (json.dumps(uids), open_seats, crn)
+                )
             else:
-                config[key].extend(values)
+                cur.execute(
+                    "INSERT INTO monitored_sections (crn, open_seats, discord_uids) VALUES (%s, %s, %s)",
+                    (crn, open_seats, json.dumps([uid]))
+                )
 
-        elif action.lower() == "remove":
-            if key == "COURSES":
-                subj, *nums = values
-                if subj in config["COURSES"]:
-                    config["COURSES"][subj] = [
-                        n for n in config["COURSES"][subj] if n not in map(int, nums)
-                    ]
-            else:
-                config[key] = [v for v in config[key] if v not in values]
-
-        elif action.lower() == "replace":
-            if key == "COURSES":
-                subj, *nums = values
-                config["COURSES"][subj] = [int(n) for n in nums]
-            else:
-                config[key] = list(values)
-
-        elif action.lower() == "show":
-            await ctx.send(f"📘 Current {key}: {json.dumps(config[key], indent=2)}")
-            return
-
-        else:
-            await ctx.send("Unknown action. Use add, remove, replace, or show.")
-            return
-
-        # Save updated config to DB
-        update_config(key, config[key])
-        invalidate_config_cache()
-        invalidate_seat_cache()  # full wipe; next scrape repopulates from fresh data
-        await ctx.send(f"✅ Updated {key} successfully.")
-
+            conn.commit()
+        update_seat_cache(crn, open_seats)
+        await interaction.followup.send(
+            f"Now tracking CRN {crn} ({subject} {course}) — {open_seats} seats open ✅",
+            ephemeral=True
+        )
     except Exception as e:
-        await ctx.send(f"Error updating config: {e}")
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+    finally:
+        conn.close()
 
-def wake_event_loop(loop):
-    """Force the asyncio event loop in another thread to get processor time."""
-    loop.call_soon_threadsafe(lambda: None)
-    time.sleep(0.05)  # micro-yield from main thread
 
+@bot.tree.command(name="untrack", description="Stop tracking a CRN")
+@app_commands.describe(crn="Course Registration Number to stop tracking")
+async def untrack(interaction: discord.Interaction, crn: str):
+    uid = interaction.user.id
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT discord_uids FROM monitored_sections WHERE crn = %s", (crn,))
+            row = cur.fetchone()
+            if not row:
+                await interaction.response.send_message(
+                    f"⚠️ CRN {crn} is not being tracked.", ephemeral=True
+                )
+                return
+
+            uids = row[0] or []
+            if uid not in uids:
+                await interaction.response.send_message(
+                    f"⚠️ You are not tracking CRN {crn}.", ephemeral=True
+                )
+                return
+
+            uids.remove(uid)
+            if uids:
+                cur.execute(
+                    "UPDATE monitored_sections SET discord_uids = %s WHERE crn = %s",
+                    (json.dumps(uids), crn)
+                )
+            else:
+                cur.execute("DELETE FROM monitored_sections WHERE crn = %s", (crn,))
+                invalidate_seat_cache(crn)
+
+            conn.commit()
+        await interaction.response.send_message(f"🗑️ Stopped tracking CRN {crn}.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+    finally:
+        conn.close()
+
+
+@bot.tree.command(name="status", description="Show all CRNs you are currently tracking")
+async def status(interaction: discord.Interaction):
+    uid = interaction.user.id
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT s.crn, s.subject, s.course, s.open_seats, s.term
+                FROM monitored_sections ms
+                JOIN sections s ON ms.crn = s.crn
+                WHERE ms.discord_uids @> %s::jsonb
+            """, (json.dumps([uid]),))
+            results = cur.fetchall()
+
+        if not results:
+            await interaction.response.send_message(
+                "You are not tracking any CRNs.", ephemeral=True
+            )
+            return
+
+        embed = discord.Embed(title="Your Tracked CRNs", color=discord.Color.green())
+        for crn, subject, course, open_seats, term in results:
+            embed.add_field(
+                name=f"{subject} {course} ({term})",
+                value=f"CRN: {crn}\nOpen Seats: {open_seats}",
+                inline=False
+            )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+    finally:
+        conn.close()
+
+
+@bot.tree.command(name="config", description="Manage active terms for scraping (owner only)")
+@app_commands.describe(action="Action to perform", term="Term string (required for add/remove)")
+@app_commands.choices(action=[
+    app_commands.Choice(name="show", value="show"),
+    app_commands.Choice(name="add", value="add"),
+    app_commands.Choice(name="remove", value="remove"),
+])
+async def config_command(interaction: discord.Interaction, action: str, term: str = None):
+    if not _is_owner(interaction):
+        await interaction.response.send_message("❌ Owner only.", ephemeral=True)
+        return
+
+    config = fetch_config()
+    terms = config.get("TERMS", [])
+
+    if action == "show":
+        await interaction.response.send_message(
+            f"📘 Active TERMS:\n```{json.dumps(terms, indent=2)}```", ephemeral=True
+        )
+    elif action == "add":
+        if not term:
+            await interaction.response.send_message("❌ Provide a term string.", ephemeral=True)
+            return
+        if term not in terms:
+            terms.append(term)
+            update_config("TERMS", terms)
+            invalidate_config_cache()
+        await interaction.response.send_message(f"✅ Added term: `{term}`", ephemeral=True)
+    elif action == "remove":
+        if not term or term not in terms:
+            await interaction.response.send_message("❌ Term not found.", ephemeral=True)
+            return
+        terms.remove(term)
+        update_config("TERMS", terms)
+        invalidate_config_cache()
+        await interaction.response.send_message(f"✅ Removed term: `{term}`", ephemeral=True)
+
+# ---- SCRAPING ----
 def generate_urls():
-    """Generate URLs using cached config (auto-refresh every 5 min)."""
-    config = fetch_config_cached()
+    """Derive scrape URLs from currently tracked sections (not from scrape_config)."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT s.term, s.subject, s.course
+                FROM monitored_sections ms
+                JOIN sections s ON ms.crn = s.crn
+            """)
+            combos = cur.fetchall()
+    finally:
+        conn.close()
+
     urls = []
-    for term in config["TERMS"]:
-        for subject in config["SUBJECTS"]:
-            for course in config["COURSES"].get(subject, []):
-                if subject == 'KINE':
-                    url = f"https://tamu.collegescheduler.com/api/terms/{term}/subjects/{subject}/courses/{course}/15/regblocks"
-                else:
-                    url = f"https://tamu.collegescheduler.com/api/terms/{term}/subjects/{subject}/courses/{course}/regblocks"
-                urls.append(url)
+    for term, subject, course in combos:
+        if str(subject).upper() == 'KINE':
+            urls.append(f"https://tamu.collegescheduler.com/api/terms/{term}/subjects/{subject}/courses/{course}/15/regblocks")
+        else:
+            urls.append(f"https://tamu.collegescheduler.com/api/terms/{term}/subjects/{subject}/courses/{course}/regblocks")
     return urls
 
 
 def process_json(json_data):
+    """Parse API responses, keeping only tracked CRNs."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT crn FROM monitored_sections")
+            tracked_crns = {row[0] for row in cur.fetchall()}
+    finally:
+        conn.close()
+
     normalized = []
     for entry in json_data:
         for section in entry["data"]["sections"]:
             if section["instructionMode"] != "Traditional Face-to-Face (F2F)":
+                continue
+            if section["id"] not in tracked_crns:
                 continue
             normalized.append({
                 "crn": section["id"],
@@ -380,19 +484,23 @@ def process_json(json_data):
 
 # ---- VERIFY CODE BROADCAST ----
 async def discord_broadcast_code(bot, code):
-    """Send verification code to Discord asynchronously."""
+    """DM the bot owner the MFA verification code."""
     try:
-        channel = bot.get_channel(int(os.getenv("DISCORD_CHANNEL_ID")))
-        if channel:
-            await channel.send(f"🔐 Verification code detected: **{code}**")
-            print("Verification message sent to Discord.")
+        owner_uid = os.getenv("DISCORD_OWNER_UID")
+        if not owner_uid:
+            print("DISCORD_OWNER_UID not set — cannot DM verification code.")
+            return
+        user = bot.get_user(int(owner_uid)) or await bot.fetch_user(int(owner_uid))
+        if user:
+            await user.send(f"🔐 Verification code: **{code}**")
+            print("Verification code DM'd to owner.")
         else:
-            print("Discord channel not found.")
+            print("Could not find owner user to DM.")
     except Exception as e:
-        print(f"Error sending Discord broadcast: {e}")
+        print(f"Error sending verification DM: {e}")
 
 
-# ---- FINAL LOGIN WITH PARALLEL CODE DETECTION ----
+# ---- LOGIN ----
 def login(email, password):
     chrome_options = Options()
     chrome_options.add_experimental_option("excludeSwitches", ["enable-logging"])
@@ -405,31 +513,26 @@ def login(email, password):
     try:
         driver.get('https://tamu.collegescheduler.com/')
 
-        # Email and password
         WebDriverWait(driver, 25).until(EC.visibility_of_element_located((By.NAME, "loginfmt")))
         driver.find_element(By.NAME, "loginfmt").send_keys(email + Keys.RETURN)
 
         WebDriverWait(driver, 25).until(EC.visibility_of_element_located((By.NAME, "passwd")))
         driver.find_element(By.NAME, "passwd").send_keys(password + Keys.RETURN)
 
-        # Click Continue button
         time.sleep(2)
         WebDriverWait(driver, 25).until(
             EC.visibility_of_element_located((By.ID, "idSIButton9"))
         ).click()
         print("Continue button clicked... waiting for verification.")
 
-        # --- NEW: Inline verification check ---
         try:
-            # Wait for verification div to appear
             WebDriverWait(driver, 30).until(
-                EC.visibility_of_element_located((By.CSS_SELECTOR, "div.verification-code"))
+                EC.visibility_of_element_located((By.CSS_SELECTOR, "span.code-text"))
             )
-            code_element = driver.find_element(By.CSS_SELECTOR, "div.verification-code")
+            code_element = driver.find_element(By.CSS_SELECTOR, "span.code-text")
             code = code_element.text.strip()
             if re.fullmatch(r'\d{3}', code):
                 print(f"Found verification code: {code}")
-                # Trigger Discord broadcast without pausing Selenium
                 asyncio.run_coroutine_threadsafe(
                     discord_broadcast_code(bot, code), bot.loop
                 )
@@ -437,9 +540,7 @@ def login(email, password):
                 print(f"Invalid code format detected: {code}")
         except Exception as wait_err:
             print(f"Verification code not detected: {wait_err}")
-        # --------------------------------------
 
-        # Continue MFA and login procedures
         try:
             WebDriverWait(driver, 65).until(
                 EC.element_to_be_clickable(
@@ -497,6 +598,9 @@ def store_data(data):
 
 def fetch_all_data(driver):
     urls = generate_urls()
+    if not urls:
+        print("No tracked CRNs — skipping scrape.")
+        return []
     data_collected = []
     driver.get("https://tamu.collegescheduler.com/schedule/current")
     time.sleep(10)
@@ -527,6 +631,8 @@ def job(driver):
         print(f"Stored {len(formatted)} records.")
     else:
         print("No valid data found.")
+    asyncio.run_coroutine_threadsafe(_refresh_api_session(driver), bot.loop)
+
 
 async def run_job_loop(driver):
     """Continuously run job(driver) every 2 minutes asynchronously."""
@@ -543,11 +649,17 @@ async def run_job_loop(driver):
 @bot.event
 async def on_ready():
     print(f"Bot logged in as {bot.user}")
-
-
-
-    # Begin Selenium login asynchronously so Discord remains responsive
     loop = asyncio.get_running_loop()
+
+    # Sync slash commands immediately — before Selenium login
+    try:
+        guild = discord.Object(id=int(os.getenv('GUILD_ID')))
+        bot.tree.copy_global_to(guild=guild)
+        synced = await bot.tree.sync(guild=guild)
+        print(f"Synced {len(synced)} slash command(s).")
+    except Exception as sync_err:
+        print(f"Failed to sync commands: {sync_err}")
+
     email = os.getenv("EMAIL")
     password = os.getenv("PASSWORD")
 
@@ -555,16 +667,15 @@ async def on_ready():
         print("Missing credentials in .env — skipping login.")
         return
 
-    # Kick off Selenium login in a non-blocking executor
     driver = await loop.run_in_executor(None, lambda: login(email, password))
     if driver:
         print("Login succeeded; driver stored on bot instance.")
         bot.driver = driver
+        bot.api_session = await loop.run_in_executor(None, _build_requests_session, driver)
         await loop.run_in_executor(None, init_seat_cache)
         asyncio.create_task(run_job_loop(driver))
     else:
         print("Login failed — driver not started.")
-
 
 
 # ---- MAIN ----
