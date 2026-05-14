@@ -92,6 +92,44 @@ def invalidate_config_cache():
     global _config_cache
     _config_cache = {"data": None, "timestamp": 0}
 
+# ---- SEAT CACHE ----
+_seat_cache: dict = {}  # {crn: open_seats}
+
+def get_cached_seats(crn: str):
+    """Return cached open_seats for a CRN, or None if not cached."""
+    return _seat_cache.get(crn)
+
+def get_all_cached_seats() -> dict:
+    """Return a shallow copy of the full seat cache."""
+    return dict(_seat_cache)
+
+def update_seat_cache(crn: str, open_seats: int):
+    """Write or overwrite the cached open_seats for a CRN."""
+    _seat_cache[crn] = open_seats
+
+def invalidate_seat_cache(crn: str = None):
+    """Evict one CRN from the cache, or clear the entire cache if crn is None."""
+    global _seat_cache
+    if crn is None:
+        _seat_cache = {}
+    else:
+        _seat_cache.pop(crn, None)
+
+def init_seat_cache():
+    """Populate _seat_cache from the sections table on startup."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT crn, open_seats FROM sections")
+            rows = cur.fetchall()
+        for crn, open_seats in rows:
+            update_seat_cache(str(crn), open_seats)
+        print(f"[Cache] Initialized seat cache with {len(rows)} entries.")
+    except Exception as e:
+        print(f"[Cache] Failed to initialize seat cache: {e}")
+    finally:
+        conn.close()
+
 # ---- DISCORD: COURSE CHECKING LOOP ----
 async def check_courses():
     try:
@@ -99,24 +137,24 @@ async def check_courses():
         print("Updating seats")
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT ms.section_id, ms.open_seats AS old_seats,
+                SELECT ms.crn, ms.open_seats AS old_seats,
                        s.open_seats AS current_seats, s.subject, s.course, s.term
                 FROM monitored_sections ms
-                JOIN sections s ON ms.section_id = s.section_id
+                JOIN sections s ON ms.crn = s.crn
                 WHERE ms.active = TRUE
             """)
             monitored_sections = cur.fetchall()
 
         for section in monitored_sections:
-            section_id, old_seats, current_seats, subject, course, term = section
+            crn, old_seats, current_seats, subject, course, term = section
             if old_seats != current_seats:
-                print(f"[DEBUG] {section_id} old:{old_seats} -> new:{current_seats}")
+                print(f"[DEBUG] {crn} old:{old_seats} -> new:{current_seats}")
                 channel = bot.get_channel(int(os.getenv('DISCORD_CHANNEL_ID')))
                 if channel:
                     await channel.send(
                         f"🚨 Seat change detected!\n"
                         f"**{subject} {course} ({term})**\n"
-                        f"Section ID: {section_id}\n"
+                        f"CRN: {crn}\n"
                         f"Seats: {old_seats} → {current_seats}"
                     )
 
@@ -124,8 +162,8 @@ async def check_courses():
                     cur.execute("""
                         UPDATE monitored_sections
                         SET open_seats = %s
-                        WHERE section_id = %s
-                    """, (current_seats, section_id))
+                        WHERE crn = %s
+                    """, (current_seats, crn))
                     conn.commit()
 
     except Exception as e:
@@ -136,46 +174,46 @@ async def check_courses():
 
 # ---- DISCORD COMMANDS ----
 @bot.command()
-async def track(ctx, section_id: str):
+async def track(ctx, crn: str):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT section_id FROM sections WHERE section_id = %s", (section_id,))
+            cur.execute("SELECT crn FROM sections WHERE crn = %s", (crn,))
             if not cur.fetchone():
-                await ctx.send("Section not found ❌")
+                await ctx.send("CRN not found ❌")
                 return
 
             cur.execute("""
-                INSERT INTO monitored_sections (section_id, channel_id, open_seats)
-                VALUES (%s, %s, (SELECT open_seats FROM sections WHERE section_id = %s))
-                ON CONFLICT (section_id) DO NOTHING
-            """, (section_id, ctx.channel.id, section_id))
+                INSERT INTO monitored_sections (crn, channel_id, open_seats)
+                VALUES (%s, %s, (SELECT open_seats FROM sections WHERE crn = %s))
+                ON CONFLICT (crn) DO NOTHING
+            """, (crn, ctx.channel.id, crn))
             conn.commit()
-            await ctx.send(f"Now tracking section {section_id} ✅")
+            await ctx.send(f"Now tracking CRN {crn} ✅")
     except Exception as e:
         await ctx.send(f"Error: {e}")
     finally:
         conn.close()
 
 @bot.command()
-async def untrack(ctx, section_id: str):
-    """Permanently stop tracking a section (delete from database)."""
+async def untrack(ctx, crn: str):
+    """Permanently stop tracking a CRN (delete from database)."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            # Delete the section from tracked sections
             cur.execute("""
                 DELETE FROM monitored_sections
-                WHERE section_id = %s
-                RETURNING section_id
-            """, (section_id,))
+                WHERE crn = %s
+                RETURNING crn
+            """, (crn,))
             deleted = cur.fetchone()
             conn.commit()
 
             if deleted:
-                await ctx.send(f"🗑️ Deleted tracking record for section {section_id}.")
+                invalidate_seat_cache(crn)
+                await ctx.send(f"🗑️ Deleted tracking record for CRN {crn}.")
             else:
-                await ctx.send(f"⚠️ No section found with ID {section_id}.")
+                await ctx.send(f"⚠️ No CRN found: {crn}.")
     except Exception as e:
         await ctx.send(f"Error removing section: {e}")
     finally:
@@ -183,24 +221,23 @@ async def untrack(ctx, section_id: str):
 
 
 @bot.command()
-async def status(ctx, section_id: str = None):
-    """Check current section status — or show all tracked."""
+async def status(ctx, crn: str = None):
+    """Check current CRN status — or show all tracked."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            if section_id:
-                # Single course lookup
+            if crn:
                 cur.execute("""
-                    SELECT subject, course, term, open_seats, last_updated 
-                    FROM sections 
-                    WHERE section_id = %s
-                """, (section_id,))
+                    SELECT subject, course, term, open_seats, last_updated
+                    FROM sections
+                    WHERE crn = %s
+                """, (crn,))
                 result = cur.fetchone()
                 if result:
                     subject, course, term, open_seats, last_updated = result
                     embed = discord.Embed(
                         title=f"{subject} {course} Status",
-                        description=f"**Section:** {section_id}",
+                        description=f"**CRN:** {crn}",
                         color=discord.Color.blue()
                     )
                     embed.add_field(name="Open Seats", value=open_seats)
@@ -208,28 +245,27 @@ async def status(ctx, section_id: str = None):
                     embed.add_field(name="Term", value=term)
                     await ctx.send(embed=embed)
                 else:
-                    await ctx.send("Section not found ❌")
+                    await ctx.send("CRN not found ❌")
             else:
-                # Show all tracked sections
                 cur.execute("""
-                    SELECT s.section_id, s.subject, s.course, s.open_seats, s.term
+                    SELECT s.crn, s.subject, s.course, s.open_seats, s.term
                     FROM monitored_sections ms
-                    JOIN sections s ON ms.section_id = s.section_id
+                    JOIN sections s ON ms.crn = s.crn
                     WHERE ms.active = TRUE
                 """)
                 results = cur.fetchall()
                 if not results:
-                    await ctx.send("No active tracked sections found ❌")
+                    await ctx.send("No active tracked CRNs found ❌")
                     return
 
                 embed = discord.Embed(
-                    title="Active Tracked Sections",
+                    title="Active Tracked CRNs",
                     color=discord.Color.green()
                 )
-                for section_id, subject, course, open_seats, term in results:
+                for crn, subject, course, open_seats, term in results:
                     embed.add_field(
                         name=f"{subject} {course} ({term})",
-                        value=f"Section ID: {section_id}\nOpen Seats: {open_seats}",
+                        value=f"CRN: {crn}\nOpen Seats: {open_seats}",
                         inline=False
                     )
                 await ctx.send(embed=embed)
@@ -293,6 +329,7 @@ async def config_scrape(ctx, action: str, key: str, *values):
         # Save updated config to DB
         update_config(key, config[key])
         invalidate_config_cache()
+        invalidate_seat_cache()  # full wipe; next scrape repopulates from fresh data
         await ctx.send(f"✅ Updated {key} successfully.")
 
     except Exception as e:
@@ -325,7 +362,7 @@ def process_json(json_data):
             if section["instructionMode"] != "Traditional Face-to-Face (F2F)":
                 continue
             normalized.append({
-                "section_id": section["id"],
+                "crn": section["id"],
                 "term": entry["url"].split("/")[5],
                 "subject": entry["url"].split("/")[7],
                 "course": entry["url"].split("/")[9],
@@ -426,25 +463,34 @@ def store_data(data):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
+            skipped = 0
             for entry in data:
+                crn = entry["crn"]
+                open_seats = entry["open_seats"]
+                cached = get_cached_seats(crn)
+                update_seat_cache(crn, open_seats)  # always keep cache current
+                if cached is not None and cached == open_seats:
+                    skipped += 1
+                    continue  # skip DB write — seats unchanged
                 cur.execute("""
-                    INSERT INTO sections (section_id, term, subject, course, open_seats, instructor, times, last_updated)
+                    INSERT INTO sections (crn, term, subject, course, open_seats, instructor, times, last_updated)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (section_id) DO UPDATE SET
+                    ON CONFLICT (crn) DO UPDATE SET
                         open_seats = EXCLUDED.open_seats,
                         times = EXCLUDED.times,
                         last_updated = EXCLUDED.last_updated
                 """, (
-                    entry["section_id"],
+                    crn,
                     entry["term"],
                     entry["subject"],
                     entry["course"],
-                    entry["open_seats"],
+                    open_seats,
                     entry["instructor"],
                     json.dumps(entry["times"]),
                     entry["last_updated"],
                 ))
         conn.commit()
+        print(f"[Cache] {skipped} entries skipped (no seat change).")
     finally:
         conn.close()
 
@@ -483,7 +529,7 @@ def job(driver):
         print("No valid data found.")
 
 async def run_job_loop(driver):
-    """Continuously run job(driver) every 10 minutes asynchronously."""
+    """Continuously run job(driver) every 2 minutes asynchronously."""
     while True:
         try:
             await asyncio.sleep(30)
@@ -491,7 +537,7 @@ async def run_job_loop(driver):
             await check_courses()
         except Exception as e:
             print(f"Job loop error: {e}")
-        await asyncio.sleep(600)  # 10 minutes
+        await asyncio.sleep(120)  # 2 minutes
 
 
 @bot.event
@@ -514,7 +560,7 @@ async def on_ready():
     if driver:
         print("Login succeeded; driver stored on bot instance.")
         bot.driver = driver
-        # Start the job loop (your recurring scraping function)
+        await loop.run_in_executor(None, init_seat_cache)
         asyncio.create_task(run_job_loop(driver))
     else:
         print("Login failed — driver not started.")
